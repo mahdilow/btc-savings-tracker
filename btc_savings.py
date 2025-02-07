@@ -18,30 +18,59 @@ import time
 
 
 @st.cache_data(ttl=3600)
-def get_historical_btc_prices(from_date: datetime.date, to_date: datetime.date) -> dict:
+def get_historical_btc_prices(
+    from_date: datetime.date,
+    to_date: datetime.date,
+    max_retries: int = 3,
+    retry_delay: float = 60.0  # Increased to 60 seconds
+) -> dict:
     """
-    Fetch historical BTC prices (in USD) from CoinGecko between from_date and to_date.
-    Returns a dictionary mapping datetime.date to price.
+    Fetch historical BTC prices with improved rate limit handling
     """
-    from_ts = int(datetime.datetime.combine(from_date, datetime.time()).timestamp())
-    to_ts = int(datetime.datetime.combine(to_date, datetime.time()).timestamp())
-    url = (
-        f"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range"
-        f"?vs_currency=usd&from={from_ts}&to={to_ts}"
-    )
-    response = requests.get(url)
-    if response.status_code == 200:
-        data = response.json()
-        prices = data.get("prices", [])
-        price_by_date = {}
-        for ts, price in prices:
-            dt = datetime.datetime.fromtimestamp(ts / 1000).date()
-            # Use the last available price for each day.
-            price_by_date[dt] = price
-        return price_by_date
-    else:
-        st.error("Error fetching historical BTC data.")
-        return {}
+    # Split date range into 90-day chunks to avoid rate limits
+    price_by_date = {}
+    chunk_size = datetime.timedelta(days=90)
+    current_from = from_date
+    
+    while current_from <= to_date:
+        current_to = min(current_from + chunk_size, to_date)
+        
+        from_ts = int(datetime.datetime.combine(current_from, datetime.time()).timestamp())
+        to_ts = int(datetime.datetime.combine(current_to, datetime.time()).timestamp())
+
+        for attempt in range(max_retries):
+            try:
+                url = (
+                    f"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range"
+                    f"?vs_currency=usd&from={from_ts}&to={to_ts}"
+                )
+                response = requests.get(url)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    prices = data.get("prices", [])
+                    for ts, price in prices:
+                        dt = datetime.datetime.fromtimestamp(ts / 1000).date()
+                        price_by_date[dt] = price
+                    break  # Success, move to next chunk
+                elif response.status_code == 429:
+                    print(f"Rate limit hit, waiting {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    print(f"Attempt {attempt + 1} failed with status code: {response.status_code}")
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay / 3)  # Shorter delay for non-rate-limit errors
+            except Exception as e:
+                print(f"Attempt {attempt + 1} failed with error: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay / 3)
+        
+        # Move to next chunk
+        current_from = current_to + datetime.timedelta(days=1)
+        time.sleep(1)  # Small delay between chunks
+    
+    return price_by_date
 
 
 def get_current_btc_price(max_retries: int = 3, retry_delay: float = 1.0) -> float:
@@ -115,7 +144,7 @@ def export_to_excel(transactions: List[Dict]) -> bytes:
     Convert transactions data to Excel file
     """
     output = io.BytesIO()
-    workbook = xlsxwriter.Workbook(output)
+    workbook = xlsxwriter.Workbook(output, {"nan_inf_to_errors": True})
     worksheet = workbook.add_worksheet("Transactions")
 
     # Add headers
@@ -133,9 +162,11 @@ def export_to_excel(transactions: List[Dict]) -> bytes:
     for row, txn in enumerate(transactions, start=1):
         worksheet.write(row, 0, txn["jalali_date"])
         worksheet.write(row, 1, txn["gregorian_date"])
-        worksheet.write(row, 2, txn["amount"])
-        worksheet.write(row, 3, txn["price"])
-        worksheet.write(row, 4, txn["total_cost"])
+        worksheet.write(row, 2, float(txn["amount"]) if pd.notna(txn["amount"]) else 0)
+        worksheet.write(row, 3, float(txn["price"]) if pd.notna(txn["price"]) else 0)
+        worksheet.write(
+            row, 4, float(txn["total_cost"]) if pd.notna(txn["total_cost"]) else 0
+        )
 
     workbook.close()
     return output.getvalue()
@@ -205,16 +236,51 @@ def is_jalali_leap_year(year: int) -> bool:
     return cycle_year in [1, 5, 9, 13, 17, 22, 26, 30]
 
 
-def initialize_btc_price():
+def initialize_price_data():
     """
-    Initialize BTC price in session state if not already present
+    Initialize both current and historical price data
+    Returns True if initialization was successful
     """
+    success = True
+    
+    # Initialize current price if not already done
     if "current_btc_price" not in st.session_state:
-        price = get_current_btc_price()
-        st.session_state["current_btc_price"] = price
-        st.session_state["price_fetch_time"] = datetime.datetime.now().strftime(
-            "%H:%M:%S"
+        with st.spinner("Fetching current BTC price..."):
+            price = get_current_btc_price()
+            if price:
+                st.session_state["current_btc_price"] = price
+                st.session_state["price_fetch_time"] = datetime.datetime.now().strftime("%H:%M:%S")
+            else:
+                success = False
+    
+    # Initialize historical prices if we have transactions
+    if (
+        "transactions" in st.session_state 
+        and st.session_state["transactions"] 
+        and (
+            "historical_prices" not in st.session_state 
+            or not st.session_state["historical_prices"]
         )
+    ):
+        try:
+            with st.spinner("Fetching historical BTC prices (this may take a few minutes)..."):
+                df = pd.DataFrame(st.session_state["transactions"])
+                df["greg_date"] = pd.to_datetime(df["gregorian_date"]).dt.date
+                earliest_date = df["greg_date"].min()
+                today = datetime.date.today()
+                
+                prices = get_historical_btc_prices(earliest_date, today)
+                if prices and len(prices) > 0:
+                    st.session_state["historical_prices"] = prices
+                    st.session_state["historical_price_fetch_time"] = datetime.datetime.now().strftime("%H:%M:%S")
+                else:
+                    success = False
+                    
+        except Exception as e:
+            success = False
+            st.error(f"Error initializing historical prices: {str(e)}")
+    
+    return success
 
 
 def display_price_section(location, section_name: str):
@@ -240,6 +306,38 @@ def display_price_section(location, section_name: str):
         return None
 
 
+def display_historical_price_section(location, df: pd.DataFrame, section_name: str):
+    """
+    Display historical price section with retry button
+    Returns the historical prices dictionary or empty dict if unavailable
+    """
+    # First check if we have valid historical prices in session state
+    if (
+        "historical_prices" in st.session_state 
+        and st.session_state["historical_prices"]
+        and isinstance(st.session_state["historical_prices"], dict)
+        and len(st.session_state["historical_prices"]) > 0
+    ):
+        return st.session_state["historical_prices"]
+    
+    # If we don't have valid prices, show error and retry button
+    col1, col2 = location.columns([3, 1])
+    col1.error(
+        "Unable to fetch historical BTC prices. Please check your internet connection."
+    )
+    if col2.button("🔄 Retry History", key=f"retry_history_{section_name}"):
+        earliest_date = df["greg_date"].min()
+        today = datetime.date.today()
+        prices = get_historical_btc_prices(earliest_date, today)
+        if prices and len(prices) > 0:  # Verify we got valid data
+            st.session_state["historical_prices"] = prices
+            st.session_state["historical_price_fetch_time"] = (
+                datetime.datetime.now().strftime("%H:%M:%S")
+            )
+            st.rerun()
+    return {}
+
+
 # -------------------------------------------------------
 # Main Application
 # -------------------------------------------------------
@@ -247,16 +345,32 @@ def display_price_section(location, section_name: str):
 
 def main():
     st.title("Bitcoin Savings & Profit Tracker")
+
+    # Add calendar preference in sidebar
+    with st.sidebar:
+        st.header("Settings")
+        if "calendar_type" not in st.session_state:
+            st.session_state["calendar_type"] = "Gregorian"
+
+        calendar_type = st.selectbox(
+            "Select Calendar Type",
+            ["Gregorian", "Jalali (Persian)"],
+            key="calendar_type",
+        )
+        st.caption("You can change the calendar type at any time.")
+
     st.write(
         "Track your BTC purchases, analyze your overall investment, and view timeline analytics."
     )
 
-    # Initialize BTC price at startup
-    initialize_btc_price()
+    # Initialize prices at startup
+    initialize_price_data()
 
-    # Add a small info text showing when price was fetched
+    # Show current price fetch time
     if "price_fetch_time" in st.session_state:
-        st.caption(f"Price last fetched at: {st.session_state['price_fetch_time']}")
+        st.caption(
+            f"Current price last fetched at: {st.session_state['price_fetch_time']}"
+        )
 
     # Initialize session state for transactions.
     if "transactions" not in st.session_state:
@@ -283,96 +397,195 @@ def main():
         # CSV Import Section with Instructions
         # -----------------------------------------------
         with st.expander("Import CSV of Transactions"):
+            if st.session_state["calendar_type"] == "Jalali (Persian)":
+                date_column = "jalali_date"
+                date_format = "YYYY-MM-DD"
+                example_date = "1402-01-15"
+            else:
+                date_column = "date"
+                date_format = "YYYY-MM-DD"
+                example_date = "2024-01-15"
+
             st.write(
-                "You can upload a CSV file containing your BTC purchase transactions. **How should your CSV look?**"
+                f"Upload a CSV file containing your BTC purchase transactions. Follow these guidelines to ensure successful import:"
             )
+
             st.markdown(
-                """
-                - **Required Columns:** `jalali_date`, `amount`, and `price`
-                - **jalali_date:** The purchase date in the Persian (Jalali) calendar, formatted as `YYYY-MM-DD` (e.g., `1402-01-15`).
-                - **amount:** The amount of BTC purchased (decimal number).
-                - **price:** The price per BTC in USD at which you bought.
+                f"""
+                ### Required CSV Format:
                 
-                **Example CSV Content:**
+                1. **Column Names (Header Row):**
+                   - `{date_column}`: Purchase date
+                   - `amount`: BTC amount purchased
+                   - `price`: Price per BTC in USD
+
+                2. **Data Format Requirements:**
+                   - **{date_column}:** {date_format} (example: {example_date})
+                   - **amount:** Decimal number (example: 0.00123456)
+                   - **price:** USD amount without $ symbol (example: 42000)
                 
-                    jalali_date,amount,price
-                    1400-12-16,0.00050000,95000
-                    1403-01-11,0.00022091,62321    
+                ### Example CSV Content:
+                ```
+                {date_column},amount,price
+                {example_date},0.00123456,42000
+                {example_date},0.00050000,43500
+                ```
+
+                ### Tips:
+                - Use comma (,) as the separator
+                - Don't include $ symbols in prices
+                - Don't include commas in numbers
+                - Dates must be in exact format: {date_format}
                 """
             )
+
+            # Add a downloadable example CSV
+            example_data = f"""{date_column},amount,price
+{example_date},0.00123456,42000
+{example_date},0.00050000,43500"""
+
+            st.download_button(
+                "📥 Download Example CSV",
+                example_data,
+                "example_transactions.csv",
+                "text/csv",
+                help="Download a sample CSV file with the correct format",
+            )
+
             uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
             if uploaded_file is not None:
                 try:
                     csv_df = pd.read_csv(uploaded_file)
-                    required_cols = ["jalali_date", "amount", "price"]
+                    required_cols = [date_column, "amount", "price"]
                     if all(col in csv_df.columns for col in required_cols):
                         if st.button("Import CSV Transactions"):
                             for idx, row in csv_df.iterrows():
-                                j_date_str = str(row["jalali_date"])
+                                date_str = str(row[date_column])
                                 try:
-                                    # Expecting the format YYYY-MM-DD.
-                                    year, month, day = map(int, j_date_str.split("-"))
-                                    j_date = jdatetime.date(year, month, day)
-                                    g_date = j_date.togregorian()
-                                except Exception as e:
+                                    # Parse date based on calendar type
+                                    if (
+                                        st.session_state["calendar_type"]
+                                        == "Jalali (Persian)"
+                                    ):
+                                        # Handle Jalali date
+                                        year, month, day = map(int, date_str.split("-"))
+                                        j_date = jdatetime.date(year, month, day)
+                                        g_date = j_date.togregorian()
+                                        jalali_str = j_date.strftime("%Y-%m-%d")
+                                    else:
+                                        # Handle Gregorian date
+                                        g_date = datetime.datetime.strptime(
+                                            date_str, "%Y-%m-%d"
+                                        ).date()
+                                        j_date = jdatetime.date.fromgregorian(
+                                            date=g_date
+                                        )
+                                        jalali_str = j_date.strftime("%Y-%m-%d")
+
+                                    amount = float(row["amount"])
+                                    price = float(row["price"])
+
+                                    # Validate date range
+                                    if g_date > datetime.date.today():
+                                        st.warning(
+                                            f"Skipping future date in row {idx + 1}: {date_str}"
+                                        )
+                                        continue
+                                    if g_date.year < 1990:
+                                        st.warning(
+                                            f"Skipping date before 1990 in row {idx + 1}: {date_str}"
+                                        )
+                                        continue
+
+                                    txn = {
+                                        "jalali_date": jalali_str,
+                                        "gregorian_date": g_date.isoformat(),
+                                        "amount": amount,
+                                        "price": price,
+                                        "total_cost": amount * price,
+                                    }
+                                    st.session_state["transactions"].append(txn)
+                                except ValueError as e:
                                     st.error(
-                                        f"Invalid date format in row {idx}: {j_date_str}"
+                                        f"Invalid date format in row {idx + 1}: {date_str}"
                                     )
                                     continue
-                                amount = float(row["amount"])
-                                price = float(row["price"])
-                                txn = {
-                                    "jalali_date": j_date.strftime("%Y-%m-%d"),
-                                    "gregorian_date": g_date.isoformat(),
-                                    "amount": amount,
-                                    "price": price,
-                                    "total_cost": amount * price,
-                                }
-                                st.session_state["transactions"].append(txn)
+                                except Exception as e:
+                                    st.error(
+                                        f"Error processing row {idx + 1}: {str(e)}"
+                                    )
+                                    continue
+
                             st.success("CSV transactions imported successfully!")
                             st.rerun()
                     else:
                         st.error(
-                            "CSV file is missing one or more required columns: 'jalali_date', 'amount', 'price'."
+                            f"CSV file is missing one or more required columns: '{date_column}', 'amount', 'price'."
                         )
                 except Exception as e:
-                    st.error("Error reading CSV file. Please check its format.")
+                    st.error(f"Error reading CSV file: {str(e)}")
 
         st.markdown("### Add a New Transaction Manually")
         # -----------------------------------------------
         # Manual Transaction Entry Section
         # -----------------------------------------------
-        # Jalali Date Picker using three selectboxes
-        st.info("Select the purchase date using the Jalali (Persian) calendar.")
-        today_jalali = jdatetime.date.today()
-        years = list(range(1370, today_jalali.year + 1))
-        default_year_index = (
-            years.index(today_jalali.year)
-            if today_jalali.year in years
-            else len(years) - 1
-        )
-        selected_year = st.selectbox("Year (Jalali)", years, index=default_year_index)
-        selected_month = st.selectbox(
-            "Month (Jalali)", list(range(1, 13)), index=today_jalali.month - 1
-        )
-        # Determine maximum day for the selected month.
-        if selected_month <= 6:
-            max_day = 31
-        elif selected_month <= 11:
-            max_day = 30
+        if st.session_state["calendar_type"] == "Jalali (Persian)":
+            st.info("Select the purchase date using the Jalali (Persian) calendar.")
+            today_jalali = jdatetime.date.today()
+            years = list(range(1370, today_jalali.year + 1))
+            default_year_index = (
+                years.index(today_jalali.year)
+                if today_jalali.year in years
+                else len(years) - 1
+            )
+            selected_year = st.selectbox(
+                "Year (Jalali)", years, index=default_year_index
+            )
+            selected_month = st.selectbox(
+                "Month (Jalali)", list(range(1, 13)), index=today_jalali.month - 1
+            )
+
+            # Determine maximum day for Jalali calendar
+            if selected_month <= 6:
+                max_day = 31
+            elif selected_month <= 11:
+                max_day = 30
+            else:
+                max_day = 30 if is_jalali_leap_year(selected_year) else 29
+
+            days = list(range(1, max_day + 1))
+            default_day_index = (
+                today_jalali.day - 1 if today_jalali.day <= max_day else 0
+            )
+            selected_day = st.selectbox("Day (Jalali)", days, index=default_day_index)
+
+            try:
+                selected_date = jdatetime.date(
+                    selected_year, selected_month, selected_day
+                )
+                gregorian_date = selected_date.togregorian()
+                display_date = selected_date.strftime("%Y-%m-%d")
+            except Exception as e:
+                st.error("Invalid Jalali date selected.")
+                return
         else:
-            max_day = 30 if is_jalali_leap_year(selected_year) else 29
-        days = list(range(1, max_day + 1))
-        default_day_index = today_jalali.day - 1 if today_jalali.day <= max_day else 0
-        selected_day = st.selectbox("Day (Jalali)", days, index=default_day_index)
+            st.info("Select the purchase date using the Gregorian calendar.")
+            today = datetime.date.today()
+            selected_date = st.date_input(
+                "Purchase Date",
+                value=today,
+                min_value=datetime.date(1990, 1, 1),
+                max_value=today,
+            )
+            gregorian_date = selected_date
+            try:
+                jalali_date = jdatetime.date.fromgregorian(date=selected_date)
+                display_date = selected_date.strftime("%Y-%m-%d")
+            except Exception as e:
+                st.error("Error converting date.")
+                return
 
-        try:
-            jalali_date = jdatetime.date(selected_year, selected_month, selected_day)
-            gregorian_date = jalali_date.togregorian()
-        except Exception as e:
-            st.error("Invalid Jalali date selected.")
-            return
-
+        # Rest of the transaction entry code
         amount = st.number_input(
             "BTC Amount", min_value=0.0, format="%.8f", step=0.00000001
         )
@@ -394,51 +607,88 @@ def main():
             else:
                 st.error("Amount and Price must be greater than zero.")
 
-        st.markdown("### Your Transactions")
+        st.markdown("### Transaction History")
         if st.session_state["transactions"]:
-            # List transactions with a delete button for each.
-            for idx, txn in enumerate(st.session_state["transactions"]):
-                cols = st.columns([1, 1, 1, 1, 1])
-                cols[0].write(f"**Date:** {txn['jalali_date']}")
-                cols[1].write(f"**BTC:** {txn['amount']:.8f}")
-                cols[2].write(f"**Price:** ${txn['price']:,.2f}")
-                cols[3].write(f"**Cost:** ${txn['total_cost']:,.2f}")
-                if cols[4].button("Delete", key=f"delete_{idx}"):
-                    st.session_state["transactions"].pop(idx)
-                    st.rerun()
+            try:
+                df = pd.DataFrame(st.session_state["transactions"])
 
-            # Also display a DataFrame of transactions.
-            df = pd.DataFrame(st.session_state["transactions"])
-            df["greg_date"] = pd.to_datetime(df["gregorian_date"]).dt.date
-            df = df.sort_values(by="greg_date")
-            st.dataframe(df[["jalali_date", "amount", "price", "total_cost"]])
+                # Determine which date column to show based on calendar preference
+                display_columns = ["amount", "price", "total_cost"]
+                if st.session_state["calendar_type"] == "Jalali (Persian)":
+                    date_col = "jalali_date"
+                    date_label = "Jalali Date"
+                else:
+                    date_col = "gregorian_date"
+                    date_label = "Date"
 
-            # Basic Summary
-            total_btc = df["amount"].sum()
-            total_cost = df["total_cost"].sum()
-            st.write(f"**Total BTC Purchased:** {total_btc:.8f}")
-            st.write(f"**Total Invested:** ${total_cost:,.2f}")
+                display_columns.insert(0, date_col)
 
-            current_btc_price = display_price_section(st, "summary")
-            if current_btc_price is not None:
-                current_value = total_btc * current_btc_price
-                profit = current_value - total_cost
-                profit_percent = (profit / total_cost * 100) if total_cost > 0 else 0
-                st.write(f"**Current Value of Holdings:** ${current_value:,.2f}")
-                st.write(f"**Profit / Loss:** ${profit:,.2f} ({profit_percent:.2f}%)")
+                # Sort by gregorian date internally
+                df["greg_date"] = pd.to_datetime(df["gregorian_date"]).dt.date
+                df = df.sort_values(by="greg_date")
 
-                # Bar chart: Invested vs. Current Value
-                chart_df = pd.DataFrame(
-                    {
-                        "Metric": ["Invested", "Current Value"],
-                        "USD": [total_cost, current_value],
-                    }
+                # Format the display data
+                display_df = df[display_columns].copy()
+
+                # Rename columns for display
+                column_labels = {
+                    date_col: date_label,
+                    "amount": "BTC Amount",
+                    "price": "Price (USD)",
+                    "total_cost": "Total Cost (USD)",
+                }
+
+                formatted_df = display_df.rename(columns=column_labels)
+
+                # Format numeric columns
+                formatted_df["BTC Amount"] = formatted_df["BTC Amount"].apply(
+                    lambda x: f"{x:.8f}"
                 )
-                st.bar_chart(chart_df.set_index("Metric"))
-            else:
-                st.error("Unable to fetch current BTC price.")
-        else:
-            st.info("No transactions added yet.")
+                formatted_df["Price (USD)"] = formatted_df["Price (USD)"].apply(
+                    lambda x: f"${x:,.2f}"
+                )
+                formatted_df["Total Cost (USD)"] = formatted_df[
+                    "Total Cost (USD)"
+                ].apply(lambda x: f"${x:,.2f}")
+
+                st.dataframe(
+                    formatted_df,
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+                # Add helpful tips for data interpretation
+                with st.expander("📊 Data Grid Tips"):
+                    st.markdown(
+                        """
+                    ### Understanding Your Transaction Data
+                    
+                    - **Date Format:** Dates are shown in {cal_type} calendar format (YYYY-MM-DD)
+                    - **BTC Amount:** Shows exact amount to 8 decimal places
+                    - **Price:** The price per BTC in USD at time of purchase
+                    - **Total Cost:** Amount × Price
+                    
+                    **Tips:**
+                    - Click column headers to sort
+                    - Use the search box to filter data
+                    - Right-click for additional options
+                    
+                    **Note:** All monetary values are in USD
+                    """.format(
+                            cal_type=(
+                                "Jalali"
+                                if st.session_state["calendar_type"]
+                                == "Jalali (Persian)"
+                                else "Gregorian"
+                            )
+                        )
+                    )
+
+            except Exception as e:
+                st.error(f"Error displaying transaction data: {str(e)}")
+                st.info(
+                    "Try refreshing the page. If the problem persists, check your transaction data for any inconsistencies."
+                )
 
         if st.button("Clear All Transactions"):
             st.session_state["transactions"] = []
@@ -724,119 +974,138 @@ def main():
             st.error("Unable to fetch current BTC price for calculations.")
 
     # ======================================================
-    # TAB 4: TIMELINE ANALYSIS (Advanced Charts)
+    # TAB 4: TIMELINE ANALYSIS
     # ======================================================
     with tabs[3]:
         st.header("Timeline Analysis")
         if st.session_state["transactions"]:
-            # Convert transactions to a DataFrame and sort by Gregorian date.
-            df = pd.DataFrame(st.session_state["transactions"])
-            df["greg_date"] = pd.to_datetime(df["gregorian_date"]).dt.date
-            df = df.sort_values(by="greg_date")
-            earliest_date = df["greg_date"].min()
-            today = datetime.date.today()
+            # Initialize historical prices if needed
+            if initialize_price_data():
+                # Get historical prices from session state
+                price_by_date = st.session_state.get("historical_prices", {})
+                
+                if price_by_date and len(price_by_date) > 0:
+                    # Show fetch time if available
+                    if "historical_price_fetch_time" in st.session_state:
+                        st.caption(f"Historical prices last fetched at: {st.session_state['historical_price_fetch_time']}")
+                    
+                    # Create and prepare DataFrame
+                    df = pd.DataFrame(st.session_state["transactions"])
+                    df["greg_date"] = pd.to_datetime(df["gregorian_date"]).dt.date
+                    df = df.sort_values(by="greg_date")
+                    
+                    # Build a daily timeline.
+                    timeline = []
+                    cumulative_btc = 0.0
+                    cumulative_cost = 0.0
+                    txn_idx = 0
+                    txns = df.to_dict("records")
+                    num_txns = len(txns)
+                    current_day = df["greg_date"].min()
 
-            # Fetch historical BTC prices between earliest transaction and today.
-            price_by_date = get_historical_btc_prices(earliest_date, today)
+                    while current_day <= datetime.date.today():
+                        # Add any transactions for the current day.
+                        while (
+                            txn_idx < num_txns and txns[txn_idx]["greg_date"] == current_day
+                        ):
+                            cumulative_btc += txns[txn_idx]["amount"]
+                            cumulative_cost += txns[txn_idx]["total_cost"]
+                            txn_idx += 1
 
-            # Build a daily timeline.
-            timeline = []
-            cumulative_btc = 0.0
-            cumulative_cost = 0.0
-            txn_idx = 0
-            txns = df.to_dict("records")
-            num_txns = len(txns)
-            current_day = earliest_date
+                        # Fetch the BTC price for the current day
+                        btc_price = price_by_date.get(current_day)
 
-            while current_day <= today:
-                # Add any transactions for the current day.
-                while txn_idx < num_txns and txns[txn_idx]["greg_date"] == current_day:
-                    cumulative_btc += txns[txn_idx]["amount"]
-                    cumulative_cost += txns[txn_idx]["total_cost"]
-                    txn_idx += 1
+                        # If the price is not available, use the last known price or fetch the current price
+                        if btc_price is None:
+                            if timeline:
+                                btc_price = timeline[-1]["btc_price"]
+                            else:
+                                btc_price = get_current_btc_price()
 
-                # Fetch the BTC price for the current day
-                btc_price = price_by_date.get(current_day)
+                        # Ensure btc_price is not None
+                        if btc_price is None:
+                            st.error(
+                                "Unable to fetch BTC price for some dates. Please check your internet connection or try again later."
+                            )
+                            return
 
-                # If the price is not available, use the last known price or fetch the current price
-                if btc_price is None:
-                    if timeline:
-                        btc_price = timeline[-1]["btc_price"]
-                    else:
-                        btc_price = get_current_btc_price()
+                        portfolio_value = cumulative_btc * btc_price
+                        profit = portfolio_value - cumulative_cost
+                        roi = (
+                            (portfolio_value / cumulative_cost * 100 - 100)
+                            if cumulative_cost > 0
+                            else 0
+                        )
+                        timeline.append(
+                            {
+                                "date": current_day,
+                                "cumulative_btc": cumulative_btc,
+                                "cumulative_cost": cumulative_cost,
+                                "btc_price": btc_price,
+                                "portfolio_value": portfolio_value,
+                                "profit": profit,
+                                "roi": roi,
+                            }
+                        )
+                        current_day += datetime.timedelta(days=1)
 
-                # Ensure btc_price is not None
-                if btc_price is None:
-                    st.error(
-                        "Unable to fetch BTC price for some dates. Please check your internet connection or try again later."
+                    timeline_df = pd.DataFrame(timeline)
+
+                    st.subheader("Cumulative Investment vs Portfolio Value")
+                    fig1 = px.line(
+                        timeline_df,
+                        x="date",
+                        y=["cumulative_cost", "portfolio_value"],
+                        labels={"value": "USD", "variable": "Metric"},
+                        title="Cumulative Investment vs Portfolio Value Over Time",
                     )
-                    return
+                    st.plotly_chart(fig1, use_container_width=True)
 
-                portfolio_value = cumulative_btc * btc_price
-                profit = portfolio_value - cumulative_cost
-                roi = (
-                    (portfolio_value / cumulative_cost * 100 - 100)
-                    if cumulative_cost > 0
-                    else 0
-                )
-                timeline.append(
-                    {
-                        "date": current_day,
-                        "cumulative_btc": cumulative_btc,
-                        "cumulative_cost": cumulative_cost,
-                        "btc_price": btc_price,
-                        "portfolio_value": portfolio_value,
-                        "profit": profit,
-                        "roi": roi,
-                    }
-                )
-                current_day += datetime.timedelta(days=1)
+                    st.subheader("Profit Over Time")
+                    fig2 = px.line(
+                        timeline_df,
+                        x="date",
+                        y="profit",
+                        title="Profit Over Time (USD)",
+                        labels={"profit": "Profit (USD)"},
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
 
-            timeline_df = pd.DataFrame(timeline)
-
-            st.subheader("Cumulative Investment vs Portfolio Value")
-            fig1 = px.line(
-                timeline_df,
-                x="date",
-                y=["cumulative_cost", "portfolio_value"],
-                labels={"value": "USD", "variable": "Metric"},
-                title="Cumulative Investment vs Portfolio Value Over Time",
-            )
-            st.plotly_chart(fig1, use_container_width=True)
-
-            st.subheader("Profit Over Time")
-            fig2 = px.line(
-                timeline_df,
-                x="date",
-                y="profit",
-                title="Profit Over Time (USD)",
-                labels={"profit": "Profit (USD)"},
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-
-            st.subheader("Return on Investment (ROI) Over Time")
-            fig3 = px.line(
-                timeline_df,
-                x="date",
-                y="roi",
-                title="ROI Over Time (%)",
-                labels={"roi": "ROI (%)"},
-            )
-            st.plotly_chart(fig3, use_container_width=True)
+                    st.subheader("Return on Investment (ROI) Over Time")
+                    fig3 = px.line(
+                        timeline_df,
+                        x="date",
+                        y="roi",
+                        title="ROI Over Time (%)",
+                        labels={"roi": "ROI (%)"},
+                    )
+                    st.plotly_chart(fig3, use_container_width=True)
+                else:
+                    st.error("Unable to fetch historical BTC prices. Please try again.")
+                    if st.button("🔄 Retry"):
+                        st.session_state.pop("historical_prices", None)
+                        st.rerun()
+            else:
+                st.error("Unable to fetch price data. Please check your internet connection.")
+                if st.button("🔄 Retry"):
+                    st.session_state.pop("historical_prices", None)
+                    st.session_state.pop("current_btc_price", None)
+                    st.rerun()
         else:
             st.info("Add transactions in the Summary tab to see timeline analysis.")
+            st.info("Add transactions in the Summary tab to enable data export.")
 
     # ======================================================
     # TAB 5: EXPORT DATA
     # ======================================================
     with tabs[4]:
         st.header("Export Your Data")
-
+        
         if st.session_state["transactions"]:
             st.info("Download your transaction history in different formats.")
-
+            
             col1, col2 = st.columns(2)
-
+            
             with col1:
                 # Excel Export
                 excel_data = export_to_excel(st.session_state["transactions"])
@@ -846,7 +1115,7 @@ def main():
                     file_name="btc_transactions.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
-
+            
             with col2:
                 # CSV Export
                 df = pd.DataFrame(st.session_state["transactions"])
@@ -857,13 +1126,27 @@ def main():
                     file_name="btc_transactions.csv",
                     mime="text/csv",
                 )
-
+            
             # Preview of export data
             st.subheader("Data Preview")
+            
+            # Determine which date column to show based on calendar preference
+            if st.session_state["calendar_type"] == "Jalali (Persian)":
+                date_col = "jalali_date"
+            else:
+                date_col = "gregorian_date"
+                
+            preview_df = pd.DataFrame(st.session_state["transactions"])
             st.dataframe(
-                pd.DataFrame(st.session_state["transactions"])[
-                    ["jalali_date", "amount", "price", "total_cost"]
-                ]
+                preview_df[[date_col, "amount", "price", "total_cost"]].rename(
+                    columns={
+                        date_col: "Date",
+                        "amount": "BTC Amount",
+                        "price": "Price (USD)",
+                        "total_cost": "Total Cost (USD)",
+                    }
+                ),
+                hide_index=True,
             )
         else:
             st.info("Add transactions in the Summary tab to enable data export.")
