@@ -1,6 +1,6 @@
 # Bitcoin Savings & Profit Tracker
 
-This application helps you track your Bitcoin purchases, analyze your overall investment, and view timeline analytics. It supports Jalali calendar dates and provides advanced analytics, DCA planning, and data export features.
+This application helps you track your Bitcoin purchases, analyze your overall investment, and view timeline analytics. It supports Persian calendar calendar dates and provides advanced analytics, DCA planning, and data export features.
 
 ## Table of Contents
 

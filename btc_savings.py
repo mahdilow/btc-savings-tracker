@@ -22,7 +22,7 @@ def get_historical_btc_prices(
     from_date: datetime.date,
     to_date: datetime.date,
     max_retries: int = 3,
-    retry_delay: float = 60.0  # Increased to 60 seconds
+    retry_delay: float = 60.0,  # Increased to 60 seconds
 ) -> dict:
     """
     Fetch historical BTC prices with improved rate limit handling
@@ -31,11 +31,13 @@ def get_historical_btc_prices(
     price_by_date = {}
     chunk_size = datetime.timedelta(days=90)
     current_from = from_date
-    
+
     while current_from <= to_date:
         current_to = min(current_from + chunk_size, to_date)
-        
-        from_ts = int(datetime.datetime.combine(current_from, datetime.time()).timestamp())
+
+        from_ts = int(
+            datetime.datetime.combine(current_from, datetime.time()).timestamp()
+        )
         to_ts = int(datetime.datetime.combine(current_to, datetime.time()).timestamp())
 
         for attempt in range(max_retries):
@@ -45,7 +47,7 @@ def get_historical_btc_prices(
                     f"?vs_currency=usd&from={from_ts}&to={to_ts}"
                 )
                 response = requests.get(url)
-                
+
                 if response.status_code == 200:
                     data = response.json()
                     prices = data.get("prices", [])
@@ -58,18 +60,22 @@ def get_historical_btc_prices(
                     time.sleep(retry_delay)
                     continue
                 else:
-                    print(f"Attempt {attempt + 1} failed with status code: {response.status_code}")
+                    print(
+                        f"Attempt {attempt + 1} failed with status code: {response.status_code}"
+                    )
                     if attempt < max_retries - 1:
-                        time.sleep(retry_delay / 3)  # Shorter delay for non-rate-limit errors
+                        time.sleep(
+                            retry_delay / 3
+                        )  # Shorter delay for non-rate-limit errors
             except Exception as e:
                 print(f"Attempt {attempt + 1} failed with error: {e}")
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay / 3)
-        
+
         # Move to next chunk
         current_from = current_to + datetime.timedelta(days=1)
         time.sleep(1)  # Small delay between chunks
-    
+
     return price_by_date
 
 
@@ -242,44 +248,50 @@ def initialize_price_data():
     Returns True if initialization was successful
     """
     success = True
-    
+
     # Initialize current price if not already done
     if "current_btc_price" not in st.session_state:
         with st.spinner("Fetching current BTC price..."):
             price = get_current_btc_price()
             if price:
                 st.session_state["current_btc_price"] = price
-                st.session_state["price_fetch_time"] = datetime.datetime.now().strftime("%H:%M:%S")
+                st.session_state["price_fetch_time"] = datetime.datetime.now().strftime(
+                    "%H:%M:%S"
+                )
             else:
                 success = False
-    
+
     # Initialize historical prices if we have transactions
     if (
-        "transactions" in st.session_state 
-        and st.session_state["transactions"] 
+        "transactions" in st.session_state
+        and st.session_state["transactions"]
         and (
-            "historical_prices" not in st.session_state 
+            "historical_prices" not in st.session_state
             or not st.session_state["historical_prices"]
         )
     ):
         try:
-            with st.spinner("Fetching historical BTC prices (this may take a few minutes)..."):
+            with st.spinner(
+                "Fetching historical BTC prices (this may take a few minutes)..."
+            ):
                 df = pd.DataFrame(st.session_state["transactions"])
                 df["greg_date"] = pd.to_datetime(df["gregorian_date"]).dt.date
                 earliest_date = df["greg_date"].min()
                 today = datetime.date.today()
-                
+
                 prices = get_historical_btc_prices(earliest_date, today)
                 if prices and len(prices) > 0:
                     st.session_state["historical_prices"] = prices
-                    st.session_state["historical_price_fetch_time"] = datetime.datetime.now().strftime("%H:%M:%S")
+                    st.session_state["historical_price_fetch_time"] = (
+                        datetime.datetime.now().strftime("%H:%M:%S")
+                    )
                 else:
                     success = False
-                    
+
         except Exception as e:
             success = False
             st.error(f"Error initializing historical prices: {str(e)}")
-    
+
     return success
 
 
@@ -313,13 +325,13 @@ def display_historical_price_section(location, df: pd.DataFrame, section_name: s
     """
     # First check if we have valid historical prices in session state
     if (
-        "historical_prices" in st.session_state 
+        "historical_prices" in st.session_state
         and st.session_state["historical_prices"]
         and isinstance(st.session_state["historical_prices"], dict)
         and len(st.session_state["historical_prices"]) > 0
     ):
         return st.session_state["historical_prices"]
-    
+
     # If we don't have valid prices, show error and retry button
     col1, col2 = location.columns([3, 1])
     col1.error(
@@ -564,6 +576,7 @@ def main():
                     selected_year, selected_month, selected_day
                 )
                 gregorian_date = selected_date.togregorian()
+                jalali_date = selected_date
                 display_date = selected_date.strftime("%Y-%m-%d")
             except Exception as e:
                 st.error("Invalid Jalali date selected.")
@@ -983,17 +996,19 @@ def main():
             if initialize_price_data():
                 # Get historical prices from session state
                 price_by_date = st.session_state.get("historical_prices", {})
-                
+
                 if price_by_date and len(price_by_date) > 0:
                     # Show fetch time if available
                     if "historical_price_fetch_time" in st.session_state:
-                        st.caption(f"Historical prices last fetched at: {st.session_state['historical_price_fetch_time']}")
-                    
+                        st.caption(
+                            f"Historical prices last fetched at: {st.session_state['historical_price_fetch_time']}"
+                        )
+
                     # Create and prepare DataFrame
                     df = pd.DataFrame(st.session_state["transactions"])
                     df["greg_date"] = pd.to_datetime(df["gregorian_date"]).dt.date
                     df = df.sort_values(by="greg_date")
-                    
+
                     # Build a daily timeline.
                     timeline = []
                     cumulative_btc = 0.0
@@ -1006,7 +1021,8 @@ def main():
                     while current_day <= datetime.date.today():
                         # Add any transactions for the current day.
                         while (
-                            txn_idx < num_txns and txns[txn_idx]["greg_date"] == current_day
+                            txn_idx < num_txns
+                            and txns[txn_idx]["greg_date"] == current_day
                         ):
                             cumulative_btc += txns[txn_idx]["amount"]
                             cumulative_cost += txns[txn_idx]["total_cost"]
@@ -1086,7 +1102,9 @@ def main():
                         st.session_state.pop("historical_prices", None)
                         st.rerun()
             else:
-                st.error("Unable to fetch price data. Please check your internet connection.")
+                st.error(
+                    "Unable to fetch price data. Please check your internet connection."
+                )
                 if st.button("🔄 Retry"):
                     st.session_state.pop("historical_prices", None)
                     st.session_state.pop("current_btc_price", None)
@@ -1100,12 +1118,12 @@ def main():
     # ======================================================
     with tabs[4]:
         st.header("Export Your Data")
-        
+
         if st.session_state["transactions"]:
             st.info("Download your transaction history in different formats.")
-            
+
             col1, col2 = st.columns(2)
-            
+
             with col1:
                 # Excel Export
                 excel_data = export_to_excel(st.session_state["transactions"])
@@ -1115,7 +1133,7 @@ def main():
                     file_name="btc_transactions.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
-            
+
             with col2:
                 # CSV Export
                 df = pd.DataFrame(st.session_state["transactions"])
@@ -1126,16 +1144,16 @@ def main():
                     file_name="btc_transactions.csv",
                     mime="text/csv",
                 )
-            
+
             # Preview of export data
             st.subheader("Data Preview")
-            
+
             # Determine which date column to show based on calendar preference
             if st.session_state["calendar_type"] == "Jalali (Persian)":
                 date_col = "jalali_date"
             else:
                 date_col = "gregorian_date"
-                
+
             preview_df = pd.DataFrame(st.session_state["transactions"])
             st.dataframe(
                 preview_df[[date_col, "amount", "price", "total_cost"]].rename(
